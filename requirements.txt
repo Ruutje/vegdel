@@ -3,3 +3,5 @@ pandas>=2.2
 numpy>=1.26
 matplotlib>=3.8
 reportlab>=4.2
+gspread>=6.0
+google-auth>=2.30
