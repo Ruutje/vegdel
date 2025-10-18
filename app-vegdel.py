@@ -169,102 +169,61 @@ def load_df() -> pd.DataFrame:
 # ==========
 # Resultaten & PDF
 # ==========
-def compute_results(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["Rank", "Cafetaria", "Gem. score (0-10)", "# Testers", "Gem. prijs (€)"])
+# ---- Resultaten
+with results_tab:
+    # Laad ruwe data en toon status
+    df = load_df()
+    st.caption(f"Rijen in 'submissions': {len(df)}")
+    with st.expander("Ruwe data (submissions)"):
+        st.dataframe(df.head(50), use_container_width=True)
 
-    # Zet kolommen goed
-    for c in WEIGHTS.keys():
-        if c not in df.columns:
-            df[c] = np.nan
+    # Recompute ranking
+    rank = compute_results(df)
 
-    # prijs naar float
-    if "price" in df.columns:
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    # Overzicht + winnaar
+    if rank.empty:
+        st.info("Nog geen scores ingevoerd of data niet herkend (controleer de header van het tabblad 'submissions').")
+        winner_row = None
     else:
-        df["price"] = np.nan
+        winner_row = rank.iloc[0]
+        with st.container(border=True):
+            st.markdown("**Overall winnaar (huidig)**")
+            st.markdown(f"### 🥇 {winner_row['Cafetaria']}")
+            st.write(
+                f"Gemiddelde score: **{winner_row['Gem. score (0-10)']:.2f}** "
+                f"• op basis van {int(winner_row['# Testers'])} tester(s)."
+            )
 
-    # Weighted average per tester per venue
-    scores_cols = list(WEIGHTS.keys())
-    for col in scores_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        st.markdown("#### Uitslag & Ranking")
+        st.dataframe(rank, use_container_width=True)
 
-    w = WEIGHTS
-    TW = TOTAL_WEIGHT
+    # PDF-actie altijd zichtbaar (disable als geen data)
+    make_pdf = st.button("⛔ Einde Vegdel / Maak PDF", disabled=rank.empty)
+    st.caption("Als deze knop uitstaat: voer eerst scores in. "
+               "Blijft de ranking leeg? Check de header van het 'submissions'-werkblad (zie hieronder).")
 
-    def row_weighted_mean(row):
-        s = 0.0
-        tot = 0.0
-        for k, ww in w.items():
-            val = row.get(k, np.nan)
-            if pd.notna(val):
-                s += float(val) * ww
-                tot += ww
-        return s / (tot or TW)
+    if make_pdf and not rank.empty:
+        pdf_bytes = build_pdf(rank)
+        st.session_state["final_pdf"] = pdf_bytes
+        st.success("Eindrapport gegenereerd. Download hieronder.")
 
-    df["_tester_avg"] = df[scores_cols].apply(row_weighted_mean, axis=1)
+    if st.session_state.get("final_pdf"):
+        st.download_button(
+            "📄 Download eindrapport (PDF)",
+            data=st.session_state["final_pdf"],
+            file_name="vegdel_eindrapport.pdf",
+            mime="application/pdf",
+        )
 
-    # Aggregate per venue
-    res = df.groupby("venue", as_index=False).agg(
-        **{
-            "Gem. score (0-10)": ("_tester_avg", "mean"),
-            "# Testers": ("tester", "nunique"),
-            "Gem. prijs (€)": ("price", "mean"),
-        }
+    st.markdown("---")
+    st.markdown("**Header die het 'submissions'-werkblad moet hebben (exact):**")
+    st.code(
+        "timestamp, tester, venue, price, "
+        "Snelheid (pan → tafel), Prijs, Overall smaak, Curry, Mayo, Uitjes, Service, remark",
+        language="text",
     )
-    res["Gem. score (0-10)"] = res["Gem. score (0-10)"].round(2)
-    res["Gem. prijs (€)"] = res["Gem. prijs (€)"].round(2)
-    res = res.sort_values(["Gem. score (0-10)", "# Testers"], ascending=[False, False]).reset_index(drop=True)
-    res.insert(0, "Rank", range(1, len(res) + 1))
-    res.rename(columns={"venue": "Cafetaria"}, inplace=True)
-    return res
+    st.caption("Als de kopteksten afwijken, hernoem de eerste rij in het werkblad naar bovenstaande namen.")
 
-
-def plot_ranking(df: pd.DataFrame) -> BytesIO:
-    buf = BytesIO()
-    plt.figure(figsize=(8, 4.5))
-    plt.bar(df["Cafetaria"], df["Gem. score (0-10)"])
-    plt.xticks(rotation=30, ha="right")
-    plt.ylabel("Gemiddelde score (0-10)")
-    plt.title("Vegdel – Ranking Frikandel Speciaal")
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=200)
-    plt.close()
-    buf.seek(0)
-    return buf
-
-
-def build_pdf(df_rank: pd.DataFrame) -> bytes:
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
-    styles = getSampleStyleSheet()
-    body = []
-
-    body += [Paragraph("<b>Vegdel – Frikandel Speciaal</b>", styles["Title"]), Spacer(1, 0.25*cm)]
-    body += [Paragraph(f"Testdatum: {TEST_DATE}", styles["Normal"]), Spacer(1, 0.3*cm)]
-
-    if not df_rank.empty:
-        winner = df_rank.iloc[0]["Cafetaria"]
-        score = df_rank.iloc[0]["Gem. score (0-10)"]
-        body += [Paragraph(f"<b>Overall winnaar:</b> {winner} (gem. {score:.2f})", styles["Heading2"]), Spacer(1, 0.2*cm)]
-
-        tbl = df_rank[["Rank", "Cafetaria", "Gem. score (0-10)", "# Testers", "Gem. prijs (€)"]]
-        data = [list(tbl.columns)] + tbl.values.tolist()
-        t = Table(data, hAlign="LEFT")
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor(PRIMARY)),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.gray),
-            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor("#f7efe9")]),
-        ]))
-        body += [Paragraph("<b>Uitslag & Ranking</b>", styles["Heading2"]), t, Spacer(1, 0.4*cm)]
-
-        chart_buf = plot_ranking(df_rank)
-        body += [Paragraph("<b>Grafiek – Gemiddelde scores</b>", styles["Heading2"]), RLImage(chart_buf, width=16*cm, height=9*cm)]
-
-    doc.build(body)
-    buffer.seek(0)
-    return buffer.read()
 
 
 # ==========
