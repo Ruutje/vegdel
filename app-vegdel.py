@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from streamlit_autorefresh import st_autorefresh
 import gspread
 from google.oauth2.service_account import Credentials
 from reportlab.lib.pagesizes import A4
@@ -235,7 +236,7 @@ st.session_state.finalized = flags.get("finalized", st.session_state.finalized)
 
 # Periodic auto-refresh while running
 if not st.session_state.finalized:
-    st.autorefresh(interval=5000, key="polling")
+    st_autorefresh(interval=5000, key="polling")
 
 # ==========================================
 # Helpers
