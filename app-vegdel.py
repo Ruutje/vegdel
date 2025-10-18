@@ -33,7 +33,22 @@ st.set_page_config(page_title="Vegdel – Frikandel Speciaal", page_icon="🌭",
 ADMIN_PIN_SECRET = "1000"  # vaste pincode
 
 # Google Sheets instellingen (vul in via Streamlit Secrets)
-SHEET_ID = st.secrets.get("SHEET_ID", None)
+SHEET_ID_RAW = st.secrets.get("SHEET_ID", None)
+
+def _normalize_sheet_id(val: str | None) -> str | None:
+    if not val:
+        return None
+    v = str(val).strip()
+    if v.startswith("http://") or v.startswith("https://"):
+        # extract between /d/ and /edit
+        try:
+            part = v.split("/d/")[1]
+            return part.split("/")[0]
+        except Exception:
+            return None
+    return v
+
+SHEET_ID = _normalize_sheet_id(SHEET_ID_RAW)
 GOOGLE_SA = st.secrets.get("google_service_account", None)
 
 GC_SCOPE = [
@@ -683,7 +698,8 @@ with results_tab:
 # ------------------
 with diag_tab:
     st.subheader("🧰 Diagnose & Verbinding")
-    st.write("SHEETS_ID:", SHEET_ID if SHEET_ID else "(niet gezet)")
+    st.write("SHEETS_ID (raw):", SHEET_ID_RAW if SHEET_ID_RAW else "(niet gezet)")
+    st.write("SHEETS_ID (parsed):", SHEET_ID if SHEET_ID else "(kon niet parsen)")
     if st.button("🔌 Test verbinding (ping)"):
         st.info("Diagnose bezig…")
         msg = diag_ping()
