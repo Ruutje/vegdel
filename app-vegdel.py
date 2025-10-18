@@ -1,8 +1,6 @@
 from __future__ import annotations
-import json
-import math
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Dict, List, Any
 
@@ -11,24 +9,28 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from streamlit_autorefresh import st_autorefresh
+
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
+# PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 from reportlab.platypus import Table, TableStyle, SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet
 
-# ==========================================
-# App Config & Theming
-# ==========================================
-PRIMARY = "#b94216"   # bruin (frikandel)
-ACCENT = "#891418"     # curry
-LIGHT  = "#ffffff"     # wit
+
+# =========================
+# Theme & Page config
+# =========================
+PRIMARY = "#b94216"     # bruin (frikandel)
+ACCENT  = "#891418"     # curry
+LIGHT   = "#ffffff"     # wit
+ADMIN_PIN = "1000"
 
 st.set_page_config(page_title="Vegdel – Frikandel Speciaal", page_icon="🌭", layout="wide")
-
 st.markdown(
     f"""
     <style>
@@ -47,52 +49,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ==========================================
-# Secrets & Google Sheets Client
-# ==========================================
-# Supports either top-level SHEET_ID, or [vegdel] block with SHEET_ID
-if "google_service_account" not in st.secrets:
-    st.error("Service account ontbreekt in secrets. Voeg [google_service_account] toe in Settings → Secrets.")
-    st.stop()
-
-creds_info = dict(st.secrets["google_service_account"])  # dict-like
-SHEET_ID_RAW = (
-    st.secrets.get("SHEET_ID")
-    or st.secrets.get("vegdel", {}).get("SHEET_ID")
-)
-
-
-def _normalize_sheet_id(val: str | None) -> str | None:
-    if not val:
-        return None
-    v = str(val).strip()
-    if v.startswith("http://") or v.startswith("https://"):
-        try:
-            part = v.split("/d/")[1]
-            return part.split("/")[0]
-        except Exception:
-            return None
-    return v
-
-SHEET_ID = _normalize_sheet_id(SHEET_ID_RAW)
-
-if not SHEET_ID:
-    st.error("SHEET_ID ontbreekt. Zet 'SHEET_ID' (of [vegdel].SHEET_ID) in Secrets. Zie Diagnose-tab voor hulp.")
-    st.stop()
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-client = gspread.authorize(creds)
-
-# ==========================================
-# Data Models & Defaults
-# ==========================================
-
-ADMIN_PIN = "1000"
-
+# =========================
+# Models & Defaults
+# =========================
 def uid() -> str:
     return uuid.uuid4().hex[:8]
 
@@ -109,21 +68,6 @@ class Venue:
     active: bool = True
     price: float = 0.0
 
-@dataclass
-class Tester:
-    key: str
-    name: str
-
-DEFAULT_CRITERIA: List[Criterion] = [
-    Criterion(uid(), "Snelheid (pan → tafel)", 1),
-    Criterion(uid(), "Prijs", 2),
-    Criterion(uid(), "Overall smaak", 3),
-    Criterion(uid(), "Curry", 2),
-    Criterion(uid(), "Mayo", 2),
-    Criterion(uid(), "Uitjes", 2),
-    Criterion(uid(), "Service", 2),
-]
-
 DEFAULT_VENUE_NAMES = [
     "Den Hijzelaar",
     "Pieperz",
@@ -136,96 +80,191 @@ DEFAULT_VENUE_NAMES = [
 ]
 DEFAULT_VENUES: List[Venue] = [Venue(uid(), n, True, 0.0) for n in DEFAULT_VENUE_NAMES]
 
-# Worksheet names
-WS_FLAGS = "flags"
-WS_VENUES = "venues"
-WS_CRITERIA = "criteria"
-WS_SUBMISSIONS = "submissions"
+DEFAULT_CRITERIA: List[Criterion] = [
+    Criterion(uid(), "Snelheid (pan → tafel)", 1),
+    Criterion(uid(), "Prijs", 2),
+    Criterion(uid(), "Overall smaak", 3),
+    Criterion(uid(), "Curry", 2),
+    Criterion(uid(), "Mayo", 2),
+    Criterion(uid(), "Uitjes", 2),
+    Criterion(uid(), "Service", 2),
+]
 
-# ==========================================
-# Google Sheets Helpers
-# ==========================================
+# Sheet tab names
+WS_FLAGS      = "flags"
+WS_VENUES     = "venues"
+WS_CRITERIA   = "criteria"
+WS_SUBMISSIONS= "submissions"
+
+
+# =========================
+# Secrets / Google Sheets client (defensief)
+# =========================
+def _normalize_sheet_id(val: str | None) -> str | None:
+    if not val:
+        return None
+    v = str(val).strip()
+    if v.startswith("http://") or v.startswith("https://"):
+        try:
+            part = v.split("/d/")[1]
+            return part.split("/")[0]
+        except Exception:
+            return None
+    return v
+
+creds_info = None
+if "google_service_account" in st.secrets:
+    creds_info = dict(st.secrets["google_service_account"])
+
+SHEET_ID_RAW = st.secrets.get("SHEET_ID") or st.secrets.get("vegdel", {}).get("SHEET_ID")
+SHEET_ID = _normalize_sheet_id(SHEET_ID_RAW)
+
+client = None
+if creds_info and SHEET_ID:
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        client = gspread.authorize(creds)
+    except Exception as e:
+        client = None
+else:
+    # Laat UI gewoon laden: Diagnose-tab helpt verder
+    pass
 
 def get_sheet():
-    return client.open_by_key(SHEET_ID)
-
+    """Open het Spreadsheet; return None met UI-melding als het niet lukt."""
+    if client is None or not SHEET_ID:
+        st.error("Geen Google Sheets-verbinding. Controleer Secrets (service account + SHEET_ID).")
+        st.caption("Ga naar tab ‘🧰 Diagnose’ om dit te controleren en te testen.")
+        return None
+    try:
+        return client.open_by_key(SHEET_ID)
+    except Exception:
+        st.error("Kan Google Sheet niet openen. Controleer of het service account Editor-rechten heeft, de ID klopt en Sheets/Drive API aanstaan.")
+        st.caption("Tip: Deel de sheet met het service account e-mailadres (Editor). Zie Diagnose-tab.")
+        return None
 
 def ensure_worksheets():
+    """Zorg dat alle tabbladen bestaan + basisheaders. Return None als sheet niet open kan."""
     sh = get_sheet()
-    existing = {ws.title for ws in sh.worksheets()}
-    wanted = {WS_FLAGS, WS_VENUES, WS_CRITERIA, WS_SUBMISSIONS}
-    for name in wanted - existing:
-        sh.add_worksheet(title=name, rows=1000, cols=26)
-    # headers & defaults
-    ws = sh.worksheet(WS_FLAGS)
-    if not ws.get_all_values():
-        ws.update([["key","value"], ["started","False"], ["finalized","False"]])
-    ws = sh.worksheet(WS_VENUES)
-    if not ws.get_all_values():
-        ws.update([["key","name","active","price"]] + [[v.key, v.name, True, 0.0] for v in DEFAULT_VENUES])
-    ws = sh.worksheet(WS_CRITERIA)
-    if not ws.get_all_values():
-        ws.update([["key","name","weight"]] + [[c.key, c.name, c.weight] for c in DEFAULT_CRITERIA])
-    ws = sh.worksheet(WS_SUBMISSIONS)
-    if not ws.get_all_values():
-        ws.update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
-    return sh
-
+    if sh is None:
+        return None
+    try:
+        existing = {ws.title for ws in sh.worksheets()}
+        wanted = {WS_FLAGS, WS_VENUES, WS_CRITERIA, WS_SUBMISSIONS}
+        for name in wanted - existing:
+            sh.add_worksheet(title=name, rows=1000, cols=26)
+        # flags
+        ws = sh.worksheet(WS_FLAGS)
+        if not ws.get_all_values():
+            ws.update([["key","value"], ["started","False"], ["finalized","False"]])
+        # venues
+        ws = sh.worksheet(WS_VENUES)
+        if not ws.get_all_values():
+            ws.update([["key","name","active","price"]] + [[v.key, v.name, True, 0.0] for v in DEFAULT_VENUES])
+        # criteria
+        ws = sh.worksheet(WS_CRITERIA)
+        if not ws.get_all_values():
+            ws.update([["key","name","weight"]] + [[c.key, c.name, c.weight] for c in DEFAULT_CRITERIA])
+        # submissions
+        ws = sh.worksheet(WS_SUBMISSIONS)
+        if not ws.get_all_values():
+            ws.update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
+        return sh
+    except Exception:
+        st.error("Kon Google Sheet tabbladen niet initialiseren.")
+        return None
 
 def read_flags() -> Dict[str, Any]:
     sh = ensure_worksheets()
-    ws = sh.worksheet(WS_FLAGS)
-    data = ws.get_all_records()
-    d = {r["key"]: r["value"] for r in data}
-    return {
-        "started": str(d.get("started","False")).lower()=="true",
-        "finalized": str(d.get("finalized","False")).lower()=="true",
-    }
-
+    if sh is None:
+        return {"started": False, "finalized": False}
+    try:
+        ws = sh.worksheet(WS_FLAGS)
+        data = ws.get_all_records()
+        d = {r["key"]: r["value"] for r in data}
+        return {"started": str(d.get("started","False")).lower()=="true",
+                "finalized": str(d.get("finalized","False")).lower()=="true"}
+    except Exception:
+        return {"started": False, "finalized": False}
 
 def write_flags(started: bool | None = None, finalized: bool | None = None):
     sh = get_sheet()
-    ws = sh.worksheet(WS_FLAGS)
-    recs = ws.get_all_records()
-    m = {r["key"]: r["value"] for r in recs}
-    if started is not None: m["started"] = str(bool(started))
-    if finalized is not None: m["finalized"] = str(bool(finalized))
-    ws.update([["key","value"]] + [[k, v] for k, v in m.items()])
-
+    if sh is None:
+        st.error("Kon flags niet opslaan (geen toegang tot sheet).")
+        return
+    try:
+        ws = sh.worksheet(WS_FLAGS)
+        recs = ws.get_all_records()
+        m = {r["key"]: r["value"] for r in recs}
+        if started is not None:  m["started"] = str(bool(started))
+        if finalized is not None: m["finalized"] = str(bool(finalized))
+        ws.update([["key","value"]] + [[k, v] for k, v in m.items()])
+    except Exception:
+        st.error("Opslaan van flags mislukte.")
 
 def read_venues() -> List[Venue]:
     sh = ensure_worksheets()
-    ws = sh.worksheet(WS_VENUES)
-    rows = ws.get_all_records()
-    return [Venue(str(r["key"]), str(r["name"]).strip(), bool(r.get("active", True)), float(r.get("price",0.0))) for r in rows]
-
+    if sh is None:
+        st.warning("Geen verbinding met Google Sheets — toon standaard venues.")
+        return [Venue(v.key, v.name, v.active, v.price) for v in DEFAULT_VENUES]
+    try:
+        ws = sh.worksheet(WS_VENUES)
+        rows = ws.get_all_records()
+        return [Venue(str(r["key"]), str(r["name"]).strip(), bool(r.get("active", True)), float(r.get("price",0.0))) for r in rows]
+    except Exception:
+        st.warning("Kon venues niet lezen — gebruik defaults.")
+        return [Venue(v.key, v.name, v.active, v.price) for v in DEFAULT_VENUES]
 
 def write_venues(vs: List[Venue]):
     sh = get_sheet()
-    ws = sh.worksheet(WS_VENUES)
-    ws.update([["key","name","active","price"]] + [[v.key, v.name, v.active, v.price] for v in vs])
-
+    if sh is None:
+        st.error("Kon venues niet opslaan (geen toegang tot sheet).")
+        return
+    try:
+        ws = sh.worksheet(WS_VENUES)
+        ws.update([["key","name","active","price"]] + [[v.key, v.name, v.active, v.price] for v in vs])
+    except Exception:
+        st.error("Opslaan van venues mislukte.")
 
 def read_criteria() -> List[Criterion]:
     sh = ensure_worksheets()
-    ws = sh.worksheet(WS_CRITERIA)
-    rows = ws.get_all_records()
-    return [Criterion(str(r["key"]), str(r["name"]).strip(), float(r.get("weight",1))) for r in rows]
-
+    if sh is None:
+        st.warning("Geen verbinding met Google Sheets — toon standaard criteria.")
+        return [Criterion(c.key, c.name, c.weight) for c in DEFAULT_CRITERIA]
+    try:
+        ws = sh.worksheet(WS_CRITERIA)
+        rows = ws.get_all_records()
+        return [Criterion(str(r["key"]), str(r["name"]).strip(), float(r.get("weight",1))) for r in rows]
+    except Exception:
+        st.warning("Kon criteria niet lezen — gebruik defaults.")
+        return [Criterion(c.key, c.name, c.weight) for c in DEFAULT_CRITERIA]
 
 def write_criteria(cs: List[Criterion]):
     sh = get_sheet()
-    ws = sh.worksheet(WS_CRITERIA)
-    ws.update([["key","name","weight"]] + [[c.key, c.name, c.weight] for c in cs])
-
+    if sh is None:
+        st.error("Kon criteria niet opslaan (geen toegang tot sheet).")
+        return
+    try:
+        ws = sh.worksheet(WS_CRITERIA)
+        ws.update([["key","name","weight"]] + [[c.key, c.name, c.weight] for c in cs])
+    except Exception:
+        st.error("Opslaan van criteria mislukte.")
 
 def append_submission(tester_name: str, v: Venue, scores_dict: Dict[str, float], remark: str):
-    """Append submission rows. Returns (ok: bool, error: str|None)."""
+    """Append submission; return (ok, error_msg|None)."""
+    sh = ensure_worksheets()
+    if sh is None:
+        return False, "Geen toegang tot Google Sheet."
     try:
-        sh = ensure_worksheets()
         ws = sh.worksheet(WS_SUBMISSIONS)
+        # herlees criteria voor sleutel/naam-consistentie
+        cs = read_criteria()
         rows = []
-        for c in read_criteria():
+        for c in cs:
             val = float(scores_dict.get(c.key, 0.0))
             rows.append([tester_name, v.key, v.name, float(v.price), c.key, c.name, val, remark])
         ws.append_rows(rows, value_input_option="RAW")
@@ -233,16 +272,21 @@ def append_submission(tester_name: str, v: Venue, scores_dict: Dict[str, float],
     except Exception as e:
         return False, str(e)
 
-
 def load_submissions_df() -> pd.DataFrame:
     sh = ensure_worksheets()
-    ws = sh.worksheet(WS_SUBMISSIONS)
-    data = ws.get_all_records()
-    return pd.DataFrame(data)
+    if sh is None:
+        return pd.DataFrame(columns=["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"])
+    try:
+        ws = sh.worksheet(WS_SUBMISSIONS)
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
+    except Exception:
+        return pd.DataFrame(columns=["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"])
 
-# ==========================================
-# Session State
-# ==========================================
+
+# =========================
+# State & shared flags
+# =========================
 if "admin_mode" not in st.session_state:
     st.session_state.admin_mode = False
 if "started" not in st.session_state:
@@ -252,27 +296,25 @@ if "finalized" not in st.session_state:
 if "final_pdf" not in st.session_state:
     st.session_state.final_pdf: bytes | None = None
 
-# Pull shared flags
 flags = read_flags()
 st.session_state.started = flags.get("started", False)
 st.session_state.finalized = flags.get("finalized", False)
 
-# Auto-refresh while not finalized
+# Auto-refresh zolang niet beëindigd (iedere 5s)
 if not st.session_state.finalized:
     st_autorefresh(interval=5000, key="polling")
 
-# Load shared config
+# Laad actuele venues/criteria
 venues: List[Venue] = read_venues()
 criteria: List[Criterion] = read_criteria()
 
-# ==========================================
-# Result Helpers
-# ==========================================
 
+# =========================
+# Helpers: resultaten & PDF
+# =========================
 def total_weight() -> float:
-    s = sum(max(0.0, float(c.weight)) for c in criteria)
-    return s if s > 0 else 1.0
-
+    w = sum(max(0.0, float(c.weight)) for c in criteria)
+    return w if w > 0 else 1.0
 
 def per_tester_top1() -> pd.DataFrame:
     sub = load_submissions_df()
@@ -284,15 +326,14 @@ def per_tester_top1() -> pd.DataFrame:
     agg = (
         sub.groupby(["tester","venue_key","venue_name"], as_index=False)
            .apply(lambda g: (g["score"]*g["w"]).sum()/TW)
-           .reset_index(name="tester_avg")
+           .reset_index(drop=True)
+           .rename(columns={0:"tester_avg"})
     )
-    # best per tester
     idx = agg.groupby("tester")["tester_avg"].idxmax()
     best = agg.loc[idx, ["tester","venue_name","tester_avg"]].copy()
     best.rename(columns={"tester":"Tester","venue_name":"#1 Cafetaria","tester_avg":"Score (0-10)"}, inplace=True)
     best["Score (0-10)"] = best["Score (0-10)"].round(2)
     return best
-
 
 def compute_results() -> pd.DataFrame:
     sub = load_submissions_df()
@@ -303,25 +344,24 @@ def compute_results() -> pd.DataFrame:
         agg = (
             sub.groupby(["tester","venue_key","venue_name","price"], as_index=False)
                .apply(lambda g: (g["score"]*g["w"]).sum()/TW)
-               .reset_index(name="tester_avg")
+               .reset_index(drop=True)
+               .rename(columns={0:"tester_avg"})
         )
         res = agg.groupby(["venue_key","venue_name","price"], as_index=False).agg(
-            **{"Gem. score (0-10)": ("tester_avg","mean"), "# Testers": ("tester","nunique")}
+            **{"Gem. score (0-10)":("tester_avg","mean"), "# Testers":("tester","nunique")}
         )
         res["Gem. score (0-10)"] = res["Gem. score (0-10)"].round(2)
-        res = res.sort_values(["Gem. score (0-10)", "# Testers"], ascending=[False, False]).reset_index(drop=True)
-        res.insert(0, "Rank", range(1, len(res)+1))
+        res = res.sort_values(["Gem. score (0-10)","# Testers"], ascending=[False, False]).reset_index(drop=True)
+        res.insert(0,"Rank", range(1, len(res)+1))
         res.rename(columns={"venue_name":"Cafetaria","price":"Prijs"}, inplace=True)
         return res
-    # empty fallback
-    return pd.DataFrame(columns=["Rank","Cafetaria","Prijs","Gem. score (0-10)","# Testers"])    
-
+    return pd.DataFrame(columns=["Rank","Cafetaria","Prijs","Gem. score (0-10)","# Testers"])
 
 def plot_ranking(df: pd.DataFrame) -> BytesIO:
     buf = BytesIO()
     plt.figure(figsize=(8, 4.5))
     plt.bar(df["Cafetaria"], df["Gem. score (0-10)"])
-    plt.xticks(rotation=30, ha='right')
+    plt.xticks(rotation=30, ha="right")
     plt.ylabel("Gemiddelde score (0-10)")
     plt.title("Vegdel – Ranking Frikandel Speciaal")
     plt.tight_layout()
@@ -330,49 +370,49 @@ def plot_ranking(df: pd.DataFrame) -> BytesIO:
     buf.seek(0)
     return buf
 
-
 def build_pdf(df: pd.DataFrame, top1_df: pd.DataFrame) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
     styles = getSampleStyleSheet()
     story = []
 
-    story += [Paragraph("<b>Vegdel – Frikandel Speciaal</b>", styles['Title']), Spacer(1, 0.3*cm)]
+    story += [Paragraph("<b>Vegdel – Frikandel Speciaal</b>", styles["Title"]), Spacer(1, 0.3*cm)]
 
     if not df.empty:
         tbl_df = df[["Rank", "Cafetaria", "Prijs", "Gem. score (0-10)", "# Testers"]]
         data = [list(tbl_df.columns)] + tbl_df.values.tolist()
-        table = Table(data, hAlign='LEFT')
+        table = Table(data, hAlign="LEFT")
         table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor(PRIMARY)),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('GRID', (0,0), (-1,-1), 0.25, colors.gray),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor('#f7efe9')]),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor(PRIMARY)),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.gray),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor("#f7efe9")]),
         ]))
-        story += [Paragraph("<b>Uitslag & Ranking</b>", styles['Heading2']), table, Spacer(1, 0.4*cm)]
+        story += [Paragraph("<b>Uitslag & Ranking</b>", styles["Heading2"]), table, Spacer(1, 0.4*cm)]
 
     if top1_df is not None and not top1_df.empty:
         tdata = [list(top1_df.columns)] + top1_df.values.tolist()
-        ttable = Table(tdata, hAlign='LEFT')
+        ttable = Table(tdata, hAlign="LEFT")
         ttable.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor(ACCENT)),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('GRID', (0,0), (-1,-1), 0.25, colors.gray),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor('#f7efe9')]),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor(ACCENT)),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.gray),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor("#f7efe9")]),
         ]))
-        story += [Paragraph("<b>Persoonlijke #1 per tester</b>", styles['Heading2']), ttable, Spacer(1, 0.4*cm)]
+        story += [Paragraph("<b>Persoonlijke #1 per tester</b>", styles["Heading2"]), ttable, Spacer(1, 0.4*cm)]
 
     if not df.empty:
         chart_buf = plot_ranking(df)
-        story += [Paragraph("<b>Grafiek – Gemiddelde scores</b>", styles['Heading2']), RLImage(chart_buf, width=16*cm, height=9*cm)]
+        story += [Paragraph("<b>Grafiek – Gemiddelde scores</b>", styles["Heading2"]), RLImage(chart_buf, width=16*cm, height=9*cm)]
 
     doc.build(story)
     buffer.seek(0)
     return buffer.read()
 
-# ==========================================
-# Header & Sidebar (Admin)
-# ==========================================
+
+# =========================
+# Header & Sidebar (admin)
+# =========================
 st.title("🥇 Vegdel – Beste friettent (Frikandel Speciaal)")
 st.caption("Testdatum: 18-10-2025 • Regels: zelfde portie • Testers vullen in op eigen device")
 
@@ -388,16 +428,17 @@ with st.sidebar:
                 st.error("Onjuiste pincode.")
     else:
         st.success("Beheer actief")
-        colA, colB = st.columns(2)
-        with colA:
+        c1, c2 = st.columns(2)
+        with c1:
             if st.button("▶️ Start Vegdel", disabled=st.session_state.started or st.session_state.finalized):
                 write_flags(started=True)
                 st.session_state.started = True
                 st.toast("Vegdel gestart — invoer geactiveerd voor iedereen.")
-        with colB:
+        with c2:
             if st.button("🔓 Uitloggen beheer"):
                 st.session_state.admin_mode = False
                 st.toast("Beheer uitgelogd.")
+
         st.divider()
         with st.expander("🗑️ Alles wissen (cloud + sessie)"):
             confirm = st.checkbox("Ik bevestig het wissen van alle data")
@@ -405,8 +446,12 @@ with st.sidebar:
                 if confirm:
                     sh = ensure_worksheets()
                     if sh:
-                        sh.worksheet(WS_SUBMISSIONS).clear()
-                        sh.worksheet(WS_SUBMISSIONS).update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
+                        try:
+                            ws = sh.worksheet(WS_SUBMISSIONS)
+                            ws.clear()
+                            ws.update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
+                        except Exception:
+                            pass
                         write_flags(started=False, finalized=False)
                         write_venues(DEFAULT_VENUES)
                         write_criteria(DEFAULT_CRITERIA)
@@ -422,25 +467,25 @@ if st.session_state.finalized:
 elif not st.session_state.started:
     st.info("Nog niet gestart. Beheerder kan starten via de sidebar.")
 
-# ==========================================
-# Tabs
-# ==========================================
-setup_tab, score_tab, results_tab, beheer_tab, diag_tab = st.tabs(["⚙️ Instellen", "🧪 Scoren", "🏆 Resultaten", "🗂️ Beheer", "🧰 Diagnose"])
 
-# ------------------
-# Tab: Instellen (basisbeheer zonder PIN, alleen weergave)
-# ------------------
+# =========================
+# Tabs
+# =========================
+setup_tab, score_tab, results_tab, beheer_tab, diag_tab = st.tabs(
+    ["⚙️ Instellen", "🧪 Scoren", "🏆 Resultaten", "🗂️ Beheer", "🧰 Diagnose"]
+)
+
+# ---- Instellen (alleen weergave; beheren doe je in Beheer-tab)
 with setup_tab:
     st.subheader("Cafetaria's & prijzen (weergave – beheer in '🗂️ Beheer')")
-    v_df = pd.DataFrame([{ "key": v.key, "Actief": v.active, "Naam": v.name, "Prijs (EUR)": float(v.price)} for v in venues])
+    v_df = pd.DataFrame([{"key": v.key, "Actief": v.active, "Naam": v.name, "Prijs (EUR)": float(v.price)} for v in venues])
     st.dataframe(v_df.drop(columns=["key"]), use_container_width=True)
+
     st.subheader("Criteria & Weging")
-    c_df = pd.DataFrame([{ "key": c.key, "Criterium": c.name, "Weging": float(c.weight)} for c in criteria])
+    c_df = pd.DataFrame([{"key": c.key, "Criterium": c.name, "Weging": float(c.weight)} for c in criteria])
     st.dataframe(c_df.drop(columns=["key"]), use_container_width=True)
 
-# ------------------
-# Tab: Scoren
-# ------------------
+# ---- Scoren
 with score_tab:
     if not st.session_state.started and not st.session_state.finalized:
         st.warning("De test is nog niet gestart. Beheerder kan starten via de sidebar.")
@@ -449,21 +494,16 @@ with score_tab:
     else:
         st.markdown("#### Wie ben je?")
         your_name = st.text_input("Vul je naam in", placeholder="Voor- en achternaam", disabled=st.session_state.finalized)
-        current_tester: Tester | None = None
-        if your_name:
-            your_name_clean = your_name.strip()
-            if your_name_clean:
-                current_tester = Tester(uid(), your_name_clean)
-        else:
+        current_name = your_name.strip() if your_name else ""
+        if not current_name:
             st.info("Vul eerst je naam in om te kunnen scoren.")
-
-        if current_tester is not None:
+        else:
             st.markdown("---")
-            st.subheader(f"Beoordelen als: {current_tester.name}")
+            st.subheader(f"Beoordelen als: {current_name}")
             active_venues = [v for v in venues if v.active]
 
             for v in active_venues:
-                with st.form(key=f"form_{current_tester.key}_{v.key}", clear_on_submit=False):
+                with st.form(key=f"form_{current_name}_{v.key}", clear_on_submit=False):
                     st.markdown(f"### {v.name}")
                     cols = st.columns(2)
                     with cols[0]:
@@ -471,36 +511,35 @@ with score_tab:
                         price_val = st.number_input("Prijs", min_value=0.0, step=0.05, value=float(v.price), key=f"price_{v.key}")
                     with cols[1]:
                         st.write("**Opmerkingen (optioneel)**")
-                        remark = st.text_area("Opmerkingen", value="", key=f"remark_{current_tester.key}_{v.key}")
+                        remark = st.text_area("Opmerkingen", value="", key=f"remark_{current_name}_{v.key}")
 
                     st.write("**Scores (0–10, stap 0,5):** Alle velden verplicht")
                     score_inputs: Dict[str, float] = {}
                     for c in criteria:
-                        score_inputs[c.key] = st.number_input(c.name, min_value=0.0, max_value=10.0, step=0.5,
-                                                              value=5.0, key=f"score_{current_tester.key}_{v.key}_{c.key}")
+                        score_inputs[c.key] = st.number_input(
+                            c.name, min_value=0.0, max_value=10.0, step=0.5, value=5.0,
+                            key=f"score_{current_name}_{v.key}_{c.key}"
+                        )
 
                     saved = st.form_submit_button("Opslaan cafetaria")
                     if saved and not st.session_state.finalized:
-                        # Validate required: every criterion must be provided
                         missing = [c.name for c in criteria if c.key not in score_inputs or score_inputs[c.key] is None]
                         if missing:
                             st.error("Niet alle criteria zijn ingevuld.")
                         else:
-                            # Update price in venues sheet
+                            # schrijf prijsupdate naar venues-sheet
                             for i, vv in enumerate(venues):
                                 if vv.key == v.key:
                                     venues[i].price = float(price_val)
                                     break
                             write_venues(venues)
-                            ok, err = append_submission(current_tester.name, v, score_inputs, remark)
+                            ok, err = append_submission(current_name, v, score_inputs, remark)
                             if ok:
-                                st.toast(f"Bedankt {current_tester.name}! {v.name} is opgeslagen.")
+                                st.toast(f"Bedankt {current_name}! {v.name} is opgeslagen.")
                             else:
                                 st.error(f"Opslaan in de cloud is niet gelukt: {err}")
 
-# ------------------
-# Tab: Resultaten
-# ------------------
+# ---- Resultaten
 with results_tab:
     df = compute_results()
     if df.empty:
@@ -520,10 +559,10 @@ with results_tab:
             st.markdown("#### Persoonlijke #1 per tester")
             st.dataframe(top1, use_container_width=True)
 
-        col1, col2 = st.columns([1,2])
-        with col1:
+        c1, c2 = st.columns([1,2])
+        with c1:
             end_clicked = st.button("⛔ Einde Vegdel", disabled=st.session_state.finalized or (not st.session_state.started) or (not st.session_state.admin_mode))
-        with col2:
+        with c2:
             st.caption("Bij beëindigen wordt alles vergrendeld en een PDF-rapport met grafieken gegenereerd. Actieve venues tellen mee; gesloten/inactieve niet.")
 
         if end_clicked:
@@ -536,27 +575,20 @@ with results_tab:
         if st.session_state.final_pdf:
             st.download_button("📄 Download eindrapport (PDF)", data=st.session_state.final_pdf, file_name="vegdel_eindrapport.pdf", mime="application/pdf")
 
-# ------------------
-# Tab: Beheer (alleen voor ingelogde beheerder)
-# ------------------
+# ---- Beheer (alleen actief na PIN)
 with beheer_tab:
     st.subheader("🗂️ Beheer")
     if not st.session_state.admin_mode:
         st.warning("Alleen toegankelijk voor beheerder. Log in met PIN 1000 in de sidebar.")
     else:
         st.success("Beheer actief")
-        # ---- Venues beheren ----
+
+        # Venues
         st.markdown("### 🏪 Cafetaria's beheren")
-        try:
-            v_list = read_venues()
-        except Exception:
-            v_list = venues
-        v_df = pd.DataFrame([{ "key": v.key, "Naam": v.name, "Actief": bool(v.active), "Prijs (EUR)": float(v.price)} for v in v_list])
+        v_list = read_venues()
+        v_df = pd.DataFrame([{"key": v.key, "Naam": v.name, "Actief": bool(v.active), "Prijs (EUR)": float(v.price)} for v in v_list])
         v_edit = st.data_editor(
-            v_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
+            v_df, num_rows="dynamic", use_container_width=True, hide_index=True,
             column_config={
                 "key": st.column_config.TextColumn("key", disabled=True),
                 "Naam": st.column_config.TextColumn("Naam"),
@@ -564,55 +596,51 @@ with beheer_tab:
                 "Prijs (EUR)": st.column_config.NumberColumn("Prijs (EUR)", min_value=0.0, step=0.05),
             },
         )
-        col_save_v, col_hint_v = st.columns([1,2])
-        with col_save_v:
+        cols_v = st.columns([1,2])
+        with cols_v[0]:
             if st.button("💾 Venues opslaan"):
                 new_vs = []
                 for _, r in v_edit.iterrows():
-                    name = str(r.get("Naam", "")).strip()
+                    name = str(r.get("Naam","")).strip()
                     if not name:
                         continue
                     new_vs.append(Venue(str(r["key"]), name, bool(r.get("Actief", True)), float(r.get("Prijs (EUR)") or 0.0)))
                 write_venues(new_vs)
                 st.toast("Venues opgeslagen in Google Sheets.")
-        with col_hint_v:
+        with cols_v[1]:
             st.caption("Tip: zet 'Actief' uit voor gesloten zaken. Nieuwe rijen kun je onderaan toevoegen.")
 
         st.divider()
-        # ---- Criteria beheren ----
+
+        # Criteria
         st.markdown("### 📊 Criteria beheren")
-        try:
-            c_list = read_criteria()
-        except Exception:
-            c_list = criteria
-        c_df = pd.DataFrame([{ "key": c.key, "Criterium": c.name, "Weging": float(c.weight)} for c in c_list])
+        c_list = read_criteria()
+        c_df = pd.DataFrame([{"key": c.key, "Criterium": c.name, "Weging": float(c.weight)} for c in c_list])
         c_edit = st.data_editor(
-            c_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
+            c_df, num_rows="dynamic", use_container_width=True, hide_index=True,
             column_config={
                 "key": st.column_config.TextColumn("key", disabled=True),
                 "Criterium": st.column_config.TextColumn("Criterium"),
                 "Weging": st.column_config.NumberColumn("Weging", min_value=0.0, step=1.0),
             },
         )
-        col_save_c, col_hint_c = st.columns([1,2])
-        with col_save_c:
+        cols_c = st.columns([1,2])
+        with cols_c[0]:
             if st.button("💾 Criteria opslaan"):
                 new_cs = []
                 for _, r in c_edit.iterrows():
-                    nm = str(r.get("Criterium", "")).strip()
+                    nm = str(r.get("Criterium","")).strip()
                     if not nm:
                         continue
                     new_cs.append(Criterion(str(r["key"]), nm, float(r.get("Weging") or 0.0)))
                 write_criteria(new_cs)
                 st.toast("Criteria opgeslagen in Google Sheets.")
-        with col_hint_c:
+        with cols_c[1]:
             st.caption("Let op: aanpassen van criteria/weging werkt door in de berekening van alle resultaten.")
 
         st.divider()
-        # ---- Data opschonen ----
+
+        # Submissions opschonen
         st.markdown("### ⚠️ Data opschonen")
         st.caption("Leeg alleen de testdata (submissions). Venues, criteria en flags blijven staan.")
         confirm_clear = st.checkbox("Ik bevestig dat ik alle testdata wil wissen", key="confirm_clear_submissions")
@@ -622,51 +650,44 @@ with beheer_tab:
             else:
                 sh = ensure_worksheets()
                 if sh:
-                    ws = sh.worksheet(WS_SUBMISSIONS)
-                    ws.clear()
-                    ws.update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
-                    st.toast("Alle testdata gewist.")
+                    try:
+                        ws = sh.worksheet(WS_SUBMISSIONS)
+                        ws.clear()
+                        ws.update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
+                        st.toast("Alle testdata gewist.")
+                    except Exception:
+                        st.error("Kon submissions niet wissen.")
                 else:
                     st.error("Kon Google Sheet niet openen. Controleer de Diagnose-tab.")
 
-# ------------------
-# Tab: Diagnose
-# ------------------
+# ---- Diagnose
 with diag_tab:
     st.subheader("🧰 Diagnose & Verbinding")
-    st.write("Service account geladen:", "✅" if st.secrets.get("google_service_account") else "❌ (niet gevonden)")
-    sa_email = (st.secrets.get("google_service_account") or {}).get("client_email") if st.secrets.get("google_service_account") else None
-    if sa_email:
-        st.write("Service account email:", sa_email)
+    st.write("Service account geladen:", "✅" if creds_info else "❌ (niet gevonden)")
+    if creds_info:
+        st.write("Service account email:", creds_info.get("client_email"))
     st.write("SHEETS_ID (raw):", SHEET_ID_RAW if SHEET_ID_RAW else "(niet gezet)")
     st.write("SHEETS_ID (parsed):", SHEET_ID if SHEET_ID else "(kon niet parsen)")
 
-    st.markdown("**Tijdelijk een Sheet ID/URL instellen (handig voor test):**")
-    if "sheet_id_override" not in st.session_state:
-        st.session_state.sheet_id_override = None
-    tmp = st.text_input("Sheet ID of volledige URL", value=st.session_state.sheet_id_override or "")
-    colx, coly = st.columns([1,1])
-    with colx:
-        if st.button("Gebruik tijdelijk deze SHEET_ID"):
-            st.session_state.sheet_id_override = tmp.strip() or None
-            st.experimental_rerun()
-    with coly:
-        if st.button("Wissen (override)"):
-            st.session_state.sheet_id_override = None
-            st.experimental_rerun()
-
     def diag_ping() -> str:
+        sh = ensure_worksheets()
+        if sh is None:
+            return "❌ Geen toegang tot Google Sheet."
         try:
-            sh = ensure_worksheets()
             ws = sh.worksheet(WS_SUBMISSIONS)
-            ws.append_row(["__DIAG__", "vkey", "vname", 0.0, "ckey", "cname", 5.0, "diagnose"], value_input_option="RAW")
+            ws.append_row(
+                ["__DIAG__", "vkey", "vname", 0.0, "ckey", "cname", 5.0, "diagnose"],
+                value_input_option="RAW"
+            )
             return f"✅ Verbinding OK met {SHEET_ID}"
         except Exception as e:
             return f"❌ Fout tijdens verbindingstest: {e}"
 
     def diag_cleanup() -> str:
+        sh = ensure_worksheets()
+        if sh is None:
+            return "❌ Geen toegang tot Google Sheet."
         try:
-            sh = ensure_worksheets()
             ws = sh.worksheet(WS_SUBMISSIONS)
             data = ws.get_all_values()
             if not data:
@@ -674,7 +695,7 @@ with diag_tab:
             header = data[0]
             rows = data[1:]
             try:
-                idx = header.index('tester')
+                idx = header.index("tester")
             except ValueError:
                 return "❌ Kolom 'tester' niet gevonden."
             keep = [header] + [r for r in rows if (len(r) > idx and r[idx] != "__DIAG__")]
@@ -684,19 +705,21 @@ with diag_tab:
         except Exception as e:
             return f"❌ Fout tijdens opschonen: {e}"
 
-    if st.button("🔌 Test verbinding (ping)"):
-        st.info("Diagnose bezig…")
-        msg = diag_ping()
-        if msg.startswith("✅"):
-            st.success(msg)
-        elif msg.startswith("⚠️"):
-            st.warning(msg)
-        else:
-            st.error(msg)
-
-    if st.button("🧽 Verwijder diagnose-rijen"):
-        msg = diag_cleanup()
-        if msg.startswith("🧽"):
-            st.success(msg)
-        else:
-            st.info(msg)
+    colD1, colD2 = st.columns(2)
+    with colD1:
+        if st.button("🔌 Test verbinding (ping)"):
+            st.info("Diagnose bezig…")
+            msg = diag_ping()
+            if msg.startswith("✅"):
+                st.success(msg)
+            elif msg.startswith("⚠️"):
+                st.warning(msg)
+            else:
+                st.error(msg)
+    with colD2:
+        if st.button("🧽 Verwijder diagnose-rijen"):
+            msg = diag_cleanup()
+            if msg.startswith("🧽"):
+                st.success(msg)
+            else:
+                st.info(msg)
