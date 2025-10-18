@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import math
 import uuid
@@ -694,4 +695,3 @@ with diag_tab:
             st.success(msg)
         else:
             st.info(msg)
-
