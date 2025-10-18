@@ -136,17 +136,20 @@ def write_criteria(cs: List[Criterion]):
     ws.update(rows)
 
 def append_submission(tester_name: str, v: Venue, scores_dict: Dict[str, float], remark: str):
-    sh = ensure_worksheets()
-    if sh is None:
-        return False
-    ws = sh.worksheet(WS_SUBMISSIONS)
-    # Append one row per criterion for simple aggregation
-    rows = []
-    for c in criteria:
-        val = float(scores_dict.get(c.key, 0.0))
-        rows.append([tester_name, v.key, v.name, float(v.price), c.key, c.name, val, remark])
-    ws.append_rows(rows, value_input_option="RAW")
-    return True
+    """Append submission rows. Returns (ok: bool, error: str|None)."""
+    try:
+        sh = ensure_worksheets()
+        if sh is None:
+            return False, "Geen verbinding met Google Sheets (check secrets en of API's aan staan)."
+        ws = sh.worksheet(WS_SUBMISSIONS)
+        rows = []
+        for c in criteria:
+            val = float(scores_dict.get(c.key, 0.0))
+            rows.append([tester_name, v.key, v.name, float(v.price), c.key, c.name, val, remark])
+        ws.append_rows(rows, value_input_option="RAW")
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 def load_submissions_df() -> pd.DataFrame:
     sh = ensure_worksheets()
@@ -631,11 +634,11 @@ with score_tab:
                                     break
                             write_venues(st.session_state.venues)
                             # Persist submission to Google Sheets (append rows)
-                            ok = append_submission(current_tester.name, v, score_inputs, remark)
+                            ok, err = append_submission(current_tester.name, v, score_inputs, remark)
                             if ok:
                                 st.toast(f"Bedankt {current_tester.name}! {v.name} is opgeslagen.")
                             else:
-                                st.error("Opslaan in de cloud is niet gelukt. Controleer de Google Sheets configuratie in secrets.")
+                                st.error(f"Opslaan in de cloud is niet gelukt: {err}")
 
 # ------------------
 # Tab: Resultaten
