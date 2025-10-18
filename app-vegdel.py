@@ -3,12 +3,14 @@ import math
 import uuid
 from dataclasses import dataclass, asdict
 from io import BytesIO
-from typing import Dict, List
+from typing import Dict, List, Any
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import gspread
+from google.oauth2.service_account import Credentials
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import cm
@@ -27,6 +29,130 @@ st.set_page_config(page_title="Vegdel – Frikandel Speciaal", page_icon="🌭",
 
 # Admin / beheer instellingen
 ADMIN_PIN_SECRET = "1000"  # vaste pincode
+
+# Google Sheets instellingen (vul in via Streamlit Secrets)
+SHEET_ID = st.secrets.get("SHEET_ID", None)
+GOOGLE_SA = st.secrets.get("google_service_account", None)
+
+GC_SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def get_gs_client():
+    if not GOOGLE_SA or not SHEET_ID:
+        return None
+    creds = Credentials.from_service_account_info(GOOGLE_SA, scopes=GC_SCOPE)
+    client = gspread.authorize(creds)
+    return client
+
+def get_sheet():
+    client = get_gs_client()
+    if client is None:
+        return None
+    return client.open_by_key(SHEET_ID)
+
+WS_FLAGS = "flags"
+WS_VENUES = "venues"
+WS_CRITERIA = "criteria"
+WS_SUBMISSIONS = "submissions"
+
+# Helper to ensure worksheets
+def ensure_worksheets():
+    sh = get_sheet()
+    if sh is None:
+        return None
+    existing = {ws.title for ws in sh.worksheets()}
+    wanted = {WS_FLAGS, WS_VENUES, WS_CRITERIA, WS_SUBMISSIONS}
+    for w in wanted - existing:
+        sh.add_worksheet(title=w, rows=1000, cols=26)
+    # headers
+    ws = sh.worksheet(WS_FLAGS)
+    if ws.row_count == 0 or not ws.get_all_values():
+        ws.update([ ["key", "value"], ["started", "False"], ["finalized", "False"] ])
+    ws = sh.worksheet(WS_VENUES)
+    if not ws.get_all_values():
+        ws.update([["key","name","active","price"]] + [[v.key, v.name, True, 0.0] for v in DEFAULT_VENUES])
+    ws = sh.worksheet(WS_CRITERIA)
+    if not ws.get_all_values():
+        ws.update([["key","name","weight"]] + [[c.key, c.name, c.weight] for c in DEFAULT_CRITERIA])
+    ws = sh.worksheet(WS_SUBMISSIONS)
+    if not ws.get_all_values():
+        ws.update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
+    return sh
+
+# Load/save functions to Sheets
+
+def read_flags() -> Dict[str, Any]:
+    sh = ensure_worksheets()
+    if sh is None:
+        return {"started": st.session_state.started, "finalized": st.session_state.finalized}
+    ws = sh.worksheet(WS_FLAGS)
+    data = ws.get_all_records()
+    out = {row["key"]: row["value"] for row in data}
+    return {"started": str(out.get("started","False")).lower()=="true", "finalized": str(out.get("finalized","False")).lower()=="true"}
+
+def write_flags(started: bool=None, finalized: bool=None):
+    sh = get_sheet()
+    if sh is None: return
+    ws = sh.worksheet(WS_FLAGS)
+    records = ws.get_all_records()
+    m = {r["key"]: r["value"] for r in records}
+    if started is not None: m["started"] = str(bool(started))
+    if finalized is not None: m["finalized"] = str(bool(finalized))
+    rows = [["key","value"]] + [[k,v] for k,v in m.items()]
+    ws.update(rows)
+
+def read_venues() -> List[Venue]:
+    sh = ensure_worksheets()
+    if sh is None:
+        return venues
+    ws = sh.worksheet(WS_VENUES)
+    rows = ws.get_all_records()
+    return [Venue(str(r["key"]), str(r["name"]), bool(r.get("active", True)), float(r.get("price",0.0))) for r in rows]
+
+def write_venues(vs: List[Venue]):
+    sh = get_sheet()
+    if sh is None: return
+    ws = sh.worksheet(WS_VENUES)
+    rows = [["key","name","active","price"]] + [[v.key, v.name, v.active, v.price] for v in vs]
+    ws.update(rows)
+
+def read_criteria() -> List[Criterion]:
+    sh = ensure_worksheets()
+    if sh is None:
+        return criteria
+    ws = sh.worksheet(WS_CRITERIA)
+    rows = ws.get_all_records()
+    return [Criterion(str(r["key"]), str(r["name"]), float(r.get("weight",1))) for r in rows]
+
+def write_criteria(cs: List[Criterion]):
+    sh = get_sheet()
+    if sh is None: return
+    ws = sh.worksheet(WS_CRITERIA)
+    rows = [["key","name","weight"]] + [[c.key, c.name, c.weight] for c in cs]
+    ws.update(rows)
+
+def append_submission(tester_name: str, v: Venue, scores_dict: Dict[str, float], remark: str):
+    sh = ensure_worksheets()
+    if sh is None:
+        return False
+    ws = sh.worksheet(WS_SUBMISSIONS)
+    # Append one row per criterion for simple aggregation
+    rows = []
+    for c in criteria:
+        val = float(scores_dict.get(c.key, 0.0))
+        rows.append([tester_name, v.key, v.name, float(v.price), c.key, c.name, val, remark])
+    ws.append_rows(rows, value_input_option="RAW")
+    return True
+
+def load_submissions_df() -> pd.DataFrame:
+    sh = ensure_worksheets()
+    if sh is None:
+        return pd.DataFrame(columns=["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"])
+    ws = sh.worksheet(WS_SUBMISSIONS)
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
 
 # ==========================================
 # Data Models & Defaults
@@ -101,9 +227,65 @@ testers = st.session_state.testers
 scores = st.session_state.scores
 remarks = st.session_state.remarks
 
+# Poll shared flags from Google Sheets for multi-user sync
+flags = read_flags()
+st.session_state.started = flags.get("started", st.session_state.started)
+st.session_state.finalized = flags.get("finalized", st.session_state.finalized)
+
+# Periodic auto-refresh while running
+if not st.session_state.finalized:
+    st.autorefresh(interval=5000, key="polling")
+
 # ==========================================
 # Helpers
 # ==========================================
+
+def diag_ping() -> str:
+    """Try to write & read a diagnostic row in submissions."""
+    try:
+        sh = ensure_worksheets()
+        if sh is None:
+            return "❌ Geen verbinding met Google Sheets (controleer secrets SHEET_ID en google_service_account)."
+        # ensure venues exist and pick first active
+        vlist = read_venues()
+        v = next((x for x in vlist if x.active), None)
+        if v is None:
+            return "⚠️ Er zijn geen actieve cafetaria's (Instellen-tab)."
+        # build fake scores using current criteria (all 5's)
+        fake_scores = {c.key: 5.0 for c in criteria}
+        ok = append_submission("__DIAG__", v, fake_scores, "diagnose ping")
+        if not ok:
+            return "❌ Kon niet naar 'submissions' schrijven. Controleer schrijfrechten."
+        # read back
+        df = load_submissions_df()
+        count = int((df['tester'] == "__DIAG__").sum()) if not df.empty else 0
+        return f"✅ Verbinding OK. Submissions bevat nu {count} DIAG-rij(en)."
+    except Exception as e:
+        return f"❌ Fout tijdens diagnose: {e}"
+
+
+def diag_cleanup() -> str:
+    try:
+        sh = ensure_worksheets()
+        if sh is None:
+            return "❌ Geen verbinding met Google Sheets."
+        ws = sh.worksheet(WS_SUBMISSIONS)
+        data = ws.get_all_values()
+        if not data:
+            return "ℹ️ Geen data om op te schonen."
+        header = data[0]
+        rows = data[1:]
+        try:
+            idx = header.index('tester')
+        except ValueError:
+            return "❌ Kolom 'tester' niet gevonden."
+        keep = [header] + [r for r in rows if (len(r) > idx and r[idx] != "__DIAG__")]
+        ws.clear()
+        ws.update(keep)
+        return "🧽 Diagnose-rijen verwijderd."
+    except Exception as e:
+        return f"❌ Fout tijdens opschonen: {e}"
+
 
 def total_weight() -> float:
     s = sum(max(0.0, float(c.weight)) for c in criteria)
@@ -116,6 +298,51 @@ def ensure_score_slot(tk: str, vk: str):
         scores[tk][vk] = {}
 
 def compute_results() -> pd.DataFrame:
+    # Compute results from submissions if available; fall back to local scores
+    sub_df = load_submissions_df()
+    if not sub_df.empty:
+        # Use current criteria weights
+        w = {c.key: float(c.weight) for c in criteria}
+        # Compute weighted avg per tester per venue
+        sub_df["w"] = sub_df["criterion_key"].map(w).fillna(0.0)
+        # Guard division
+        TW = sum(w.values()) or 1.0
+        agg = (sub_df.groupby(["tester","venue_key","venue_name","price"], as_index=False)
+                      .apply(lambda g: (g["score"]*g["w"]).sum()/TW).reset_index(name="tester_avg"))
+        # Average across testers
+        res = agg.groupby(["venue_key","venue_name","price"], as_index=False).agg(
+            **{"Gem. score (0-10)": ("tester_avg","mean"), "# Testers": ("tester","nunique")}
+        )
+        res["Gem. score (0-10)"] = res["Gem. score (0-10)"].round(2)
+        res = res.sort_values(["Gem. score (0-10)", "# Testers"], ascending=[False, False]).reset_index(drop=True)
+        res.insert(0, "Rank", range(1, len(res)+1))
+        res.rename(columns={"venue_name":"Cafetaria","price":"Prijs"}, inplace=True)
+        return res
+    # Fallback to in-session (single-user) storage
+    active_venues = [v for v in venues if v.active]
+    TW = total_weight()
+    rows = []
+    for v in active_venues:
+        tester_avgs = []
+        for t in testers:
+            t_scores = scores.get(t.key, {}).get(v.key, {})
+            if not t_scores:
+                continue
+            s = sum(float(t_scores.get(c.key, 0.0)) * float(c.weight) for c in criteria)
+            tester_avgs.append(s / TW)
+        avg = float(np.mean(tester_avgs)) if tester_avgs else 0.0
+        rows.append({
+            "venue_key": v.key,
+            "Cafetaria": v.name,
+            "Prijs": v.price,
+            "Gem. score (0-10)": round(avg, 2),
+            "# Testers": len(tester_avgs),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by=["Gem. score (0-10)", "# Testers"], ascending=[False, False]).reset_index(drop=True)
+        df.insert(0, "Rank", range(1, len(df) + 1))
+    return df
     active_venues = [v for v in venues if v.active]
     TW = total_weight()
     rows = []
@@ -238,11 +465,22 @@ with st.sidebar:
         with colA:
             if st.button("▶️ Start Vegdel", disabled=st.session_state.started or st.session_state.finalized):
                 st.session_state.started = True
-                st.toast("Vegdel gestart — invoer geactiveerd.")
+                write_flags(started=True)
+                st.toast("Vegdel gestart — invoer geactiveerd voor iedereen.")
         with colB:
             if st.button("🗑️ Alles wissen", type="secondary"):
                 confirm = st.checkbox("Ik bevestig het wissen van alle data")
                 if confirm:
+                    # Reset Google Sheet content
+                    sh = ensure_worksheets()
+                    if sh:
+                        sh.worksheet(WS_SUBMISSIONS).clear()
+                        sh.worksheet(WS_SUBMISSIONS).update([["tester","venue_key","venue_name","price","criterion_key","criterion_name","score","remark"]])
+                        write_flags(started=False, finalized=False)
+                        # reset venues & criteria to defaults
+                        write_venues(DEFAULT_VENUES)
+                        write_criteria(DEFAULT_CRITERIA)
+                    # reset local session
                     st.session_state.scores = {}
                     st.session_state.remarks = {}
                     st.session_state.finalized = False
@@ -251,7 +489,7 @@ with st.sidebar:
                     st.session_state.venues = DEFAULT_VENUES
                     st.session_state.criteria = DEFAULT_CRITERIA
                     st.session_state.testers = []
-                    st.toast("Alle data gewist en gereset.")
+                    st.toast("Alle data gewist (cloud + sessie).")
                 else:
                     st.warning("Vink de bevestiging aan om te wissen.")
         if st.button("🔓 Uitloggen beheer"):
@@ -266,7 +504,7 @@ elif not st.session_state.started:
 # ==========================================
 # Tabs
 # ==========================================
-setup_tab, score_tab, results_tab = st.tabs(["⚙️ Instellen", "🧪 Scoren", "🏆 Resultaten"]) 
+setup_tab, score_tab, results_tab, diag_tab = st.tabs(["⚙️ Instellen", "🧪 Scoren", "🏆 Resultaten", "🧰 Diagnose"]) 
 
 # ------------------
 # Tab: Instellen
@@ -384,23 +622,18 @@ with score_tab:
                         if missing:
                             st.error("Niet alle criteria zijn ingevuld.")
                         else:
-                            # Save price
+                            # Save price locally and to sheet venues
                             for i, vv in enumerate(st.session_state.venues):
                                 if vv.key == v.key:
                                     st.session_state.venues[i].price = float(price_val)
                                     break
-                            # Save scores
-                            if current_tester.key not in st.session_state.scores:
-                                st.session_state.scores[current_tester.key] = {}
-                            if v.key not in st.session_state.scores[current_tester.key]:
-                                st.session_state.scores[current_tester.key][v.key] = {}
-                            for ck, val in score_inputs.items():
-                                st.session_state.scores[current_tester.key][v.key][ck] = float(val)
-                            # Save remark (optional)
-                            if current_tester.key not in st.session_state.remarks:
-                                st.session_state.remarks[current_tester.key] = {}
-                            st.session_state.remarks[current_tester.key][v.key] = remark
-                            st.toast(f"Bedankt {current_tester.name}! {v.name} is opgeslagen.")
+                            write_venues(st.session_state.venues)
+                            # Persist submission to Google Sheets (append rows)
+                            ok = append_submission(current_tester.name, v, score_inputs, remark)
+                            if ok:
+                                st.toast(f"Bedankt {current_tester.name}! {v.name} is opgeslagen.")
+                            else:
+                                st.error("Opslaan in de cloud is niet gelukt. Controleer de Google Sheets configuratie in secrets.")
 
 # ------------------
 # Tab: Resultaten
@@ -432,9 +665,33 @@ with results_tab:
 
         if end_clicked:
             st.session_state.finalized = True
+            write_flags(finalized=True)
             pdf_bytes = build_pdf(df, top1)
             st.session_state.final_pdf = pdf_bytes
             st.success("Eindrapport is gegenereerd en de invoer is vergrendeld.")
 
         if st.session_state.final_pdf:
             st.download_button("📄 Download eindrapport (PDF)", data=st.session_state.final_pdf, file_name="vegdel_eindrapport.pdf", mime="application/pdf")
+
+# ------------------
+# Tab: Diagnose
+# ------------------
+with diag_tab:
+    st.subheader("🧰 Diagnose & Verbinding")
+    st.write("SHEETS_ID:", SHEET_ID if SHEET_ID else "(niet gezet)")
+    if st.button("🔌 Test verbinding (ping)"):
+        st.info("Diagnose bezig…")
+        msg = diag_ping()
+        if msg.startswith("✅"):
+            st.success(msg)
+        elif msg.startswith("⚠️"):
+            st.warning(msg)
+        else:
+            st.error(msg)
+    if st.button("🧽 Verwijder diagnose-rijen"):
+        msg = diag_cleanup()
+        if msg.startswith("🧽"):
+            st.success(msg)
+        else:
+            st.info(msg)
+
